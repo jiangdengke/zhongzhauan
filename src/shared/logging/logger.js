@@ -1,6 +1,13 @@
 import { randomUUID } from "crypto";
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
+import { dirname, resolve } from "path";
 
 const LOG_FORMAT = process.env.LOG_FORMAT ?? "pretty";
+const LOG_FILE_ENABLED = process.env.LOG_FILE_ENABLED !== "false";
+const LOG_FILE_DIR = process.env.LOG_FILE_DIR ?? "logs";
+const LOG_FILE_TIME_UNIT = process.env.LOG_FILE_TIME_UNIT ?? "hour";
+const LOG_FILE_MAX_BYTES = Number(process.env.LOG_FILE_MAX_BYTES ?? 5 * 1024 * 1024);
+const LOG_FILE_MAX_BACKUPS = Number(process.env.LOG_FILE_MAX_BACKUPS ?? 5);
 
 const MESSAGE_LABELS = {
   voiceMonitor: {
@@ -120,13 +127,25 @@ export function formatError(error) {
   };
 }
 
-function formatTimestamp(date) {
-  const pad = (value, width = 2) => String(value).padStart(width, "0");
+function padNumber(value, width = 2) {
+  return String(value).padStart(width, "0");
+}
 
+function formatTimestamp(date) {
   return [
-    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
-    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`,
+    `${date.getFullYear()}-${padNumber(date.getMonth() + 1)}-${padNumber(date.getDate())}`,
+    `${padNumber(date.getHours())}:${padNumber(date.getMinutes())}:${padNumber(date.getSeconds())}.${padNumber(date.getMilliseconds(), 3)}`,
   ].join(" ");
+}
+
+function getLogFilePath(date) {
+  const day = `${date.getFullYear()}-${padNumber(date.getMonth() + 1)}-${padNumber(date.getDate())}`;
+
+  if (LOG_FILE_TIME_UNIT === "day") {
+    return resolve(LOG_FILE_DIR, `${day}.log`);
+  }
+
+  return resolve(LOG_FILE_DIR, day, `${padNumber(date.getHours())}.log`);
 }
 
 function readableMessage(scope, message) {
@@ -222,9 +241,56 @@ function formatPretty(record) {
   return detailText ? `${line} | ${detailText}` : line;
 }
 
+function rotateLogFile(filePath) {
+  if (
+    !Number.isFinite(LOG_FILE_MAX_BYTES) ||
+    LOG_FILE_MAX_BYTES <= 0 ||
+    !Number.isFinite(LOG_FILE_MAX_BACKUPS) ||
+    LOG_FILE_MAX_BACKUPS <= 0 ||
+    !existsSync(filePath)
+  ) {
+    return;
+  }
+
+  if (statSync(filePath).size < LOG_FILE_MAX_BYTES) {
+    return;
+  }
+
+  for (let index = LOG_FILE_MAX_BACKUPS; index >= 1; index -= 1) {
+    const source = index === 1 ? filePath : `${filePath}.${index - 1}`;
+    const target = `${filePath}.${index}`;
+
+    if (!existsSync(source)) {
+      continue;
+    }
+
+    if (index === LOG_FILE_MAX_BACKUPS && existsSync(target)) {
+      unlinkSync(target);
+    }
+
+    renameSync(source, target);
+  }
+}
+
+function appendLogFile(line, date) {
+  if (!LOG_FILE_ENABLED) {
+    return;
+  }
+
+  try {
+    const filePath = getLogFilePath(date);
+    mkdirSync(dirname(filePath), { recursive: true });
+    rotateLogFile(filePath);
+    appendFileSync(filePath, `${line}\n`, "utf8");
+  } catch (error) {
+    console.error(`日志文件写入失败: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function emit(level, scope, message, details = {}) {
+  const date = new Date();
   const record = {
-    ts: new Date().toISOString(),
+    ts: date.toISOString(),
     level,
     scope,
     message,
@@ -232,6 +298,7 @@ function emit(level, scope, message, details = {}) {
   };
 
   const line = LOG_FORMAT === "json" ? JSON.stringify(record) : formatPretty(record);
+  appendLogFile(line, date);
 
   if (level === "error") {
     console.error(line);
