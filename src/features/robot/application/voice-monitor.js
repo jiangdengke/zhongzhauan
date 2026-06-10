@@ -1,6 +1,7 @@
 import { logError, logInfo, makeTraceId } from "@/shared/logging/logger.js";
 import { readString } from "@/shared/strings.js";
 import { DEFAULT_ROBOT_ID, VOICE_PHASE, VOICE_STATUS } from "../domain/constants.js";
+import { publishRobotEvent } from "./robot-events.js";
 
 function isVoiceStatus(value) {
   return value === VOICE_STATUS.recordingStarted || value === VOICE_STATUS.recordingEnded;
@@ -10,6 +11,13 @@ export function createInvalidVoiceJsonResult({ traceId = makeTraceId("voice"), s
   logError("voiceMonitor", "invalid_json", {
     traceId,
     durationMs: Date.now() - startedAt,
+  });
+
+  publishRobotEvent("robot_error", {
+    traceId,
+    scope: "voiceMonitor",
+    reason: "invalid_json",
+    message: "Invalid JSON",
   });
 
   return {
@@ -33,6 +41,15 @@ export function handleVoiceMonitor(payload, options = {}) {
       durationMs: Date.now() - startedAt,
     });
 
+    publishRobotEvent("robot_error", {
+      traceId,
+      robotId,
+      scope: "voiceMonitor",
+      reason: "invalid_status",
+      status,
+      message: 'status must be "0" or "1"',
+    });
+
     return {
       status: 400,
       traceId,
@@ -41,6 +58,14 @@ export function handleVoiceMonitor(payload, options = {}) {
   }
 
   logInfo("voiceMonitor", "request_completed", {
+    traceId,
+    robotId,
+    status,
+    phase: VOICE_PHASE[status],
+    durationMs: Date.now() - startedAt,
+  });
+
+  publishRobotEvent("voice", {
     traceId,
     robotId,
     status,

@@ -45,6 +45,49 @@ function parseSseBlock(block) {
   }
 }
 
+function parseEventData(message) {
+  try {
+    return JSON.parse(message.data);
+  } catch {
+    return null;
+  }
+}
+
+export function subscribeRobotEvents(handlers = {}) {
+  if (typeof EventSource === "undefined") {
+    return () => {};
+  }
+
+  const source = new EventSource("/robot/events");
+  const eventNames = [
+    "ready",
+    "voice",
+    "asr_partial",
+    "final_input",
+    "deepseek_delta",
+    "tts_done",
+    "robot_error",
+  ];
+
+  source.onopen = () => {
+    handlers.onOpen?.();
+  };
+
+  source.onerror = () => {
+    handlers.onError?.();
+  };
+
+  for (const eventName of eventNames) {
+    source.addEventListener(eventName, (message) => {
+      handlers.onEvent?.(eventName, parseEventData(message));
+    });
+  }
+
+  return () => {
+    source.close();
+  };
+}
+
 export async function sendChatMessageStream(content, handlers = {}) {
   const payload = createSpeechContextPayload(content);
   const response = await fetch("/robot/listenQwen/stream", {

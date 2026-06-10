@@ -1,13 +1,21 @@
-import { getDeepSeekReply } from "@/integrations/deepseek/client.js";
+import { getDeepSeekReplyStream } from "@/integrations/deepseek/client.js";
 import { logError, logInfo, makeTraceId, previewText } from "@/shared/logging/logger.js";
 import { DEFAULT_ROBOT_ID, ROBOT_EVENTS, ROBOT_REPLIES } from "../domain/constants.js";
 import { createCommandReply } from "./command-replies.js";
 import { createAcceptedPayload, createResponsePayload, normalizeListenPayload } from "./listen-request.js";
+import { publishRobotEvent } from "./robot-events.js";
 
 export function createInvalidListenJsonResult({ requestId = makeTraceId("listen"), startedAt = Date.now() } = {}) {
   logError("listenQwen", "invalid_json", {
     traceId: requestId,
     durationMs: Date.now() - startedAt,
+  });
+
+  publishRobotEvent("robot_error", {
+    traceId: requestId,
+    scope: "listenQwen",
+    reason: "invalid_json",
+    message: ROBOT_REPLIES.invalidJson,
   });
 
   return {
@@ -20,7 +28,7 @@ export function createInvalidListenJsonResult({ requestId = makeTraceId("listen"
 export async function handleListenQwen(payload, options = {}, dependencies = {}) {
   const requestId = options.requestId ?? makeTraceId("listen");
   const startedAt = options.startedAt ?? Date.now();
-  const getConversationReply = dependencies.getConversationReply ?? getDeepSeekReply;
+  const getConversationReplyStream = dependencies.getConversationReplyStream ?? getDeepSeekReplyStream;
   const request = normalizeListenPayload(payload, requestId);
 
   logInfo("listenQwen", "request_received", {
@@ -38,10 +46,33 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
   });
 
   if (request.event === ROBOT_EVENTS.speechContext) {
-    const reply = await getConversationReply(request.content, {
+    publishRobotEvent("final_input", {
+      traceId: request.traceId,
+      requestId,
+      robotId: request.robotId,
+      event: request.event,
+      language: request.language,
+      sessionId: request.sessionId,
+      content: request.content,
+    });
+
+    let reply = "";
+    let chunkCount = 0;
+
+    for await (const chunk of getConversationReplyStream(request.content, {
       traceId: request.traceId,
       sessionId: request.sessionId,
-    });
+    })) {
+      reply += chunk;
+      chunkCount += 1;
+      publishRobotEvent("deepseek_delta", {
+        traceId: request.traceId,
+        sessionId: request.sessionId,
+        robotId: request.robotId,
+        content: chunk,
+        chunkIndex: chunkCount,
+      });
+    }
 
     logInfo("listenQwen", "response_ready", {
       traceId: request.traceId,
@@ -50,7 +81,19 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
       event: request.event,
       durationMs: Date.now() - startedAt,
       replyPreview: previewText(reply, 120),
+      chunkCount,
       stream: false,
+    });
+
+    publishRobotEvent("tts_done", {
+      traceId: request.traceId,
+      sessionId: request.sessionId,
+      robotId: request.robotId,
+      event: ROBOT_EVENTS.responseContext,
+      sourceEvent: request.event,
+      content: reply,
+      chunkCount,
+      durationMs: Date.now() - startedAt,
     });
 
     return {
@@ -61,6 +104,15 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
   }
 
   if (request.event === ROBOT_EVENTS.asrPartial) {
+    publishRobotEvent("asr_partial", {
+      traceId: request.traceId,
+      requestId,
+      robotId: request.robotId,
+      language: request.language,
+      sessionId: request.sessionId,
+      content: request.content,
+    });
+
     logInfo("listenQwen", "asr_partial_received", {
       traceId: request.traceId,
       sessionId: request.sessionId,
@@ -79,6 +131,18 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
   }
 
   if (request.event === ROBOT_EVENTS.command) {
+    publishRobotEvent("final_input", {
+      traceId: request.traceId,
+      requestId,
+      robotId: request.robotId,
+      event: request.event,
+      language: request.language,
+      sessionId: request.sessionId,
+      functionName: request.functionName,
+      functionParam: request.functionParam,
+      content: request.content,
+    });
+
     const commandReply = createCommandReply(request);
 
     logInfo("listenQwen", "branch_cmd", {
@@ -90,6 +154,17 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
       durationMs: Date.now() - startedAt,
       replyPreview: previewText(commandReply.reply, 120),
       stream: false,
+    });
+
+    publishRobotEvent("tts_done", {
+      traceId: request.traceId,
+      sessionId: request.sessionId,
+      robotId: request.robotId,
+      event: ROBOT_EVENTS.responseContext,
+      sourceEvent: request.event,
+      functionName: request.functionName,
+      content: commandReply.reply,
+      durationMs: Date.now() - startedAt,
     });
 
     return {
@@ -106,6 +181,15 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
     event: request.event,
     durationMs: Date.now() - startedAt,
     stream: false,
+  });
+
+  publishRobotEvent("robot_error", {
+    traceId: request.traceId,
+    sessionId: request.sessionId,
+    robotId: request.robotId,
+    event: request.event,
+    reason: "unknown_event",
+    message: ROBOT_REPLIES.unknownEvent,
   });
 
   return {

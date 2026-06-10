@@ -1,14 +1,14 @@
 "use client";
 
-import { useState } from "react";
-import { sendChatMessageStream } from "./chat-api.js";
+import { useEffect, useRef, useState } from "react";
+import { sendChatMessageStream, subscribeRobotEvents } from "./chat-api.js";
 import { quickPrompts } from "./examples.js";
 
 const initialMessages = [
   {
     id: "welcome",
     role: "assistant",
-    content: "你好，我是机器人对话助手。你输入的话会按机器人协议发给 DeepSeek。",
+    content: "你好，我是机器人对话助手。你输入的话会按机器人协议发给 DeepSeek；上游机器人请求也会在这里实时显示。",
   },
 ];
 
@@ -37,12 +37,323 @@ function formatJson(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function formatTime(value) {
+  if (!value) {
+    return "--:--:--";
+  }
+
+  return new Date(value).toLocaleTimeString("zh-CN", {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function getEventLabel(type) {
+  const labels = {
+    ready: "监听已连接",
+    voice: "语音状态",
+    asr_partial: "ASR 中间结果",
+    final_input: "最终输入",
+    deepseek_delta: "DeepSeek 流式输出",
+    tts_done: "最终 TTS",
+    robot_error: "接口异常",
+  };
+
+  return labels[type] || type;
+}
+
+function summarizeMonitorEvent(type, event) {
+  const data = event?.data || event || {};
+
+  if (type === "voice") {
+    return data.status === "1" ? "用户开始说话 / 机器人开始监听" : "用户说话结束 / 开始处理";
+  }
+
+  if (type === "asr_partial") {
+    return data.content || "空 ASR 中间结果";
+  }
+
+  if (type === "final_input") {
+    if (data.event === "CMD") {
+      return `${data.functionName || "CMD"} ${typeof data.functionParam === "string" ? data.functionParam : ""}`.trim();
+    }
+
+    return data.content || data.event || "最终输入已收到";
+  }
+
+  if (type === "deepseek_delta") {
+    return data.content || "";
+  }
+
+  if (type === "tts_done") {
+    return data.content || "TTS 文案已生成";
+  }
+
+  if (type === "robot_error") {
+    return data.message || data.reason || "接口异常";
+  }
+
+  return data.ok ? "SSE 已连接" : "等待事件";
+}
+
+function getUpstreamConversationKey(event, data) {
+  return data.traceId || data.sessionId || event?.id || `upstream-${Date.now()}`;
+}
+
+function createUpstreamInputContent(event, data) {
+  if (data.event === "CMD") {
+    return summarizeMonitorEvent("final_input", event) || "上游命令已收到";
+  }
+
+  return data.content || "上游输入已收到";
+}
+
+function createAsrPartialContent(data) {
+  return data.content ? `正在识别：${data.content}` : "正在识别...";
+}
+
+const initialMonitorState = {
+  traceId: "",
+  voiceStatus: "",
+  phase: "",
+  latestAsr: "",
+  finalInput: "",
+  functionName: "",
+  streamReply: "",
+  finalTts: "",
+  error: "",
+};
+
 export function RobotConsolePage() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [lastExchange, setLastExchange] = useState(null);
+  const [monitorConnected, setMonitorConnected] = useState(false);
+  const [monitorState, setMonitorState] = useState(initialMonitorState);
+  const [monitorEvents, setMonitorEvents] = useState([]);
+  const upstreamChatsRef = useRef({});
+  const processedRobotEventIdsRef = useRef(new Set());
+
+  useEffect(() => {
+    function hasProcessedRobotEvent(event) {
+      if (!event?.id) {
+        return false;
+      }
+
+      const processedIds = processedRobotEventIdsRef.current;
+
+      if (processedIds.has(event.id)) {
+        return true;
+      }
+
+      processedIds.add(event.id);
+
+      if (processedIds.size > 500) {
+        processedIds.clear();
+      }
+
+      return false;
+    }
+
+    function getUpstreamChat(key) {
+      if (!upstreamChatsRef.current[key]) {
+        upstreamChatsRef.current[key] = {
+          userMessageId: "",
+          assistantMessageId: "",
+        };
+      }
+
+      return upstreamChatsRef.current[key];
+    }
+
+    function upsertUpstreamUserMessage(chat, content) {
+      if (chat.userMessageId) {
+        setMessages((current) => updateMessageContent(
+          current,
+          chat.userMessageId,
+          () => content,
+        ));
+        return;
+      }
+
+      const message = createMessage("user", content);
+      chat.userMessageId = message.id;
+      setMessages((current) => [...current, message]);
+    }
+
+    function ensureUpstreamAssistantMessage(chat) {
+      if (chat.assistantMessageId) {
+        return chat.assistantMessageId;
+      }
+
+      const message = createMessage("assistant", "");
+      chat.assistantMessageId = message.id;
+      setMessages((current) => [...current, message]);
+      return message.id;
+    }
+
+    function applyUpstreamChatEvent(eventName, event, data) {
+      if (event?.replayed || hasProcessedRobotEvent(event)) {
+        return;
+      }
+
+      if (!["asr_partial", "final_input", "deepseek_delta", "tts_done", "robot_error"].includes(eventName)) {
+        return;
+      }
+
+      const key = getUpstreamConversationKey(event, data);
+      const chat = getUpstreamChat(key);
+
+      if (eventName === "asr_partial") {
+        upsertUpstreamUserMessage(chat, createAsrPartialContent(data));
+        return;
+      }
+
+      if (eventName === "final_input") {
+        upsertUpstreamUserMessage(chat, createUpstreamInputContent(event, data));
+        ensureUpstreamAssistantMessage(chat);
+        return;
+      }
+
+      if (eventName === "deepseek_delta") {
+        if (!data.content) {
+          return;
+        }
+
+        const assistantMessageId = ensureUpstreamAssistantMessage(chat);
+        setMessages((current) => updateMessageContent(
+          current,
+          assistantMessageId,
+          (previousContent) => `${previousContent}${data.content}`,
+        ));
+        return;
+      }
+
+      if (eventName === "tts_done") {
+        if (!data.content) {
+          return;
+        }
+
+        const assistantMessageId = ensureUpstreamAssistantMessage(chat);
+        setMessages((current) => updateMessageContent(
+          current,
+          assistantMessageId,
+          () => data.content,
+        ));
+        return;
+      }
+
+      if (eventName === "robot_error") {
+        const message = data.message || data.reason || "接口异常";
+        const assistantMessageId = ensureUpstreamAssistantMessage(chat);
+        setMessages((current) => updateMessageContent(
+          current,
+          assistantMessageId,
+          (previousContent) => previousContent || message,
+        ));
+      }
+    }
+
+    return subscribeRobotEvents({
+      onOpen: () => {
+        setMonitorConnected(true);
+      },
+      onError: () => {
+        setMonitorConnected(false);
+      },
+      onEvent: (eventName, event) => {
+        const data = event?.data || event || {};
+        applyUpstreamChatEvent(eventName, event, data);
+
+        const displayEvent = {
+          id: event?.id || `${eventName}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          type: eventName,
+          at: event?.at || data.at || new Date().toISOString(),
+          traceId: data.traceId || event?.traceId || "",
+          summary: summarizeMonitorEvent(eventName, event),
+        };
+
+        setMonitorEvents((current) => [displayEvent, ...current].slice(0, 40));
+        setMonitorState((current) => {
+          if (eventName === "ready") {
+            return {
+              ...current,
+              error: "",
+            };
+          }
+
+          if (eventName === "voice") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              voiceStatus: data.status || "",
+              phase: data.phase || "",
+              error: "",
+            };
+          }
+
+          if (eventName === "asr_partial") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              latestAsr: data.content || "",
+              error: "",
+            };
+          }
+
+          if (eventName === "final_input") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              finalInput: data.event === "CMD" ? summarizeMonitorEvent(eventName, event) : data.content || "",
+              functionName: data.functionName || "",
+              streamReply: "",
+              finalTts: "",
+              error: "",
+            };
+          }
+
+          if (eventName === "deepseek_delta") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              streamReply: `${current.streamReply}${data.content || ""}`,
+              error: "",
+            };
+          }
+
+          if (eventName === "tts_done") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              finalTts: data.content || "",
+              streamReply: current.streamReply || data.content || "",
+              error: "",
+            };
+          }
+
+          if (eventName === "robot_error") {
+            return {
+              ...current,
+              traceId: data.traceId || current.traceId,
+              error: data.message || data.reason || "接口异常",
+            };
+          }
+
+          return current;
+        });
+      },
+    });
+  }, []);
+
+  function clearMonitor() {
+    setMonitorState(initialMonitorState);
+    setMonitorEvents([]);
+  }
 
   async function submitMessage(event) {
     event.preventDefault();
@@ -184,23 +495,90 @@ export function RobotConsolePage() {
       </section>
 
       <aside className="inspector">
-        <p className="eyebrow">Robot Payload</p>
-        <h2>本次请求</h2>
-        <dl>
-          <div>
-            <dt>HTTP</dt>
-            <dd>{lastExchange ? lastExchange.status : "暂无"}</dd>
+        <section className="inspector-section">
+          <p className="eyebrow">Robot Payload</p>
+          <h2>本次请求</h2>
+          <dl>
+            <div>
+              <dt>HTTP</dt>
+              <dd>{lastExchange ? lastExchange.status : "暂无"}</dd>
+            </div>
+            <div>
+              <dt>Trace ID</dt>
+              <dd>{lastExchange?.traceId || "暂无"}</dd>
+            </div>
+            <div>
+              <dt>Event</dt>
+              <dd>{lastExchange?.payload?.event || "SPEECH_CONTEXT"}</dd>
+            </div>
+          </dl>
+          <pre>{lastExchange ? formatJson(lastExchange.payload) : "发送消息后展示机器人请求体"}</pre>
+        </section>
+
+        <section className="inspector-section monitor-panel">
+          <div className="monitor-heading">
+            <div>
+              <p className="eyebrow">Upstream Monitor</p>
+              <h2>上游实时监听</h2>
+            </div>
+            <span className={`monitor-status ${monitorConnected ? "connected" : "disconnected"}`}>
+              {monitorConnected ? "已连接" : "未连接"}
+            </span>
           </div>
-          <div>
-            <dt>Trace ID</dt>
-            <dd>{lastExchange?.traceId || "暂无"}</dd>
+
+          <dl className="monitor-fields">
+            <div>
+              <dt>Trace</dt>
+              <dd>{monitorState.traceId || "暂无"}</dd>
+            </div>
+            <div>
+              <dt>Voice</dt>
+              <dd>{monitorState.voiceStatus ? `${monitorState.voiceStatus} / ${monitorState.phase}` : "暂无"}</dd>
+            </div>
+            <div>
+              <dt>ASR</dt>
+              <dd>{monitorState.latestAsr || "暂无"}</dd>
+            </div>
+            <div>
+              <dt>Final</dt>
+              <dd>{monitorState.finalInput || "暂无"}</dd>
+            </div>
+            <div>
+              <dt>Reply</dt>
+              <dd>{monitorState.streamReply || "暂无"}</dd>
+            </div>
+            <div>
+              <dt>TTS</dt>
+              <dd>{monitorState.finalTts || "暂无"}</dd>
+            </div>
+            {monitorState.error ? (
+              <div>
+                <dt>Error</dt>
+                <dd>{monitorState.error}</dd>
+              </div>
+            ) : null}
+          </dl>
+
+          <div className="monitor-actions">
+            <button type="button" onClick={clearMonitor}>清空监听</button>
+            <span>GET /robot/events</span>
           </div>
-          <div>
-            <dt>Event</dt>
-            <dd>{lastExchange?.payload?.event || "SPEECH_CONTEXT"}</dd>
+
+          <div className="event-feed" aria-label="上游事件流">
+            {monitorEvents.length === 0 ? (
+              <p className="empty-feed">等待上游请求...</p>
+            ) : monitorEvents.map((event) => (
+              <article className={`event-item ${event.type}`} key={event.id}>
+                <div className="event-meta">
+                  <span>{formatTime(event.at)}</span>
+                  <strong>{getEventLabel(event.type)}</strong>
+                </div>
+                <p>{event.summary}</p>
+                {event.traceId ? <small>{event.traceId}</small> : null}
+              </article>
+            ))}
           </div>
-        </dl>
-        <pre>{lastExchange ? formatJson(lastExchange.payload) : "发送消息后展示机器人请求体"}</pre>
+        </section>
       </aside>
 
       <style jsx>{`
@@ -221,11 +599,11 @@ export function RobotConsolePage() {
 
         .chat-shell {
           min-height: 100vh;
-          width: min(1240px, calc(100vw - 32px));
+          width: min(1440px, calc(100vw - 32px));
           margin: 0 auto;
           padding: 32px 0;
           display: grid;
-          grid-template-columns: minmax(0, 1fr) 340px;
+          grid-template-columns: minmax(0, 1fr) 420px;
           gap: 20px;
         }
 
@@ -488,7 +866,127 @@ export function RobotConsolePage() {
           position: sticky;
           top: 32px;
           border-radius: 30px;
-          padding: 22px;
+          padding: 18px;
+          display: grid;
+          gap: 18px;
+          max-height: calc(100vh - 64px);
+          overflow: auto;
+        }
+
+        .inspector-section {
+          min-width: 0;
+        }
+
+        .inspector-section + .inspector-section {
+          border-top: 1px solid rgba(36, 26, 18, 0.1);
+          padding-top: 18px;
+        }
+
+        .monitor-heading {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: flex-start;
+        }
+
+        .monitor-status {
+          flex: 0 0 auto;
+          border: 1px solid rgba(36, 26, 18, 0.14);
+          border-radius: 999px;
+          padding: 6px 9px;
+          font-size: 12px;
+          font-weight: 800;
+        }
+
+        .monitor-status.connected {
+          color: #23543a;
+          background: rgba(66, 121, 90, 0.14);
+        }
+
+        .monitor-status.disconnected {
+          color: #6f2d20;
+          background: rgba(111, 45, 32, 0.12);
+        }
+
+        .monitor-fields {
+          margin: 16px 0;
+        }
+
+        .monitor-actions {
+          display: flex;
+          justify-content: space-between;
+          gap: 10px;
+          align-items: center;
+          margin-bottom: 12px;
+        }
+
+        .monitor-actions button {
+          padding: 8px 12px;
+          font-size: 13px;
+        }
+
+        .monitor-actions span {
+          color: #77624d;
+          font-family: "SFMono-Regular", "Menlo", monospace;
+          font-size: 11px;
+        }
+
+        .event-feed {
+          display: grid;
+          gap: 10px;
+          max-height: 360px;
+          overflow: auto;
+        }
+
+        .empty-feed {
+          margin: 0;
+          border: 1px dashed rgba(36, 26, 18, 0.18);
+          border-radius: 16px;
+          padding: 14px;
+          color: #77624d;
+          font-size: 13px;
+        }
+
+        .event-item {
+          border: 1px solid rgba(36, 26, 18, 0.11);
+          border-radius: 16px;
+          padding: 10px 11px;
+          background: rgba(255, 255, 255, 0.56);
+        }
+
+        .event-item.deepseek_delta {
+          background: rgba(66, 121, 90, 0.11);
+        }
+
+        .event-item.robot_error {
+          background: rgba(111, 45, 32, 0.11);
+        }
+
+        .event-meta {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          color: #77624d;
+          font-family: "SFMono-Regular", "Menlo", monospace;
+          font-size: 11px;
+        }
+
+        .event-meta strong {
+          color: #5e4a37;
+        }
+
+        .event-item p {
+          margin: 7px 0 0;
+          line-height: 1.55;
+          overflow-wrap: anywhere;
+        }
+
+        .event-item small {
+          display: block;
+          margin-top: 6px;
+          color: #8b735c;
+          font-family: "SFMono-Regular", "Menlo", monospace;
+          overflow-wrap: anywhere;
         }
 
         dl {
