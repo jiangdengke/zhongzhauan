@@ -1,9 +1,83 @@
 import { getDeepSeekReplyStream } from "@/integrations/deepseek/client.js";
 import { logError, logInfo, makeTraceId, previewText } from "@/shared/logging/logger.js";
-import { DEFAULT_ROBOT_ID, ROBOT_EVENTS, ROBOT_REPLIES } from "../domain/constants.js";
+import { DEFAULT_ROBOT_ID, ROBOT_EVENTS, ROBOT_FUNCTIONS, ROBOT_REPLIES } from "../domain/constants.js";
 import { createCommandReply } from "./command-replies.js";
 import { createAcceptedPayload, createResponsePayload, normalizeListenPayload } from "./listen-request.js";
 import { publishRobotEvent } from "./robot-events.js";
+
+const COMMAND_SESSION_TTL_MS = 5 * 60 * 1000;
+const MAX_COMMAND_SESSIONS = 200;
+const FLIGHT_NO_PATTERN = /\b((?:CA|MU|CZ|HU|ZH|SC|MF|3U|HO|GS|EU|G5)\s*\d{3,4})\b/i;
+
+function getCommandSessionState() {
+  if (!globalThis.__robotCommandSessionState) {
+    globalThis.__robotCommandSessionState = {
+      sessions: new Map(),
+    };
+  }
+
+  return globalThis.__robotCommandSessionState;
+}
+
+function pruneCommandSessions(state, now = Date.now()) {
+  for (const [sessionId, session] of state.sessions) {
+    if (now - session.createdAt > COMMAND_SESSION_TTL_MS) {
+      state.sessions.delete(sessionId);
+    }
+  }
+
+  while (state.sessions.size > MAX_COMMAND_SESSIONS) {
+    const oldestSessionId = state.sessions.keys().next().value;
+
+    if (!oldestSessionId) {
+      return;
+    }
+
+    state.sessions.delete(oldestSessionId);
+  }
+}
+
+function readCommandSession(sessionId) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const state = getCommandSessionState();
+  pruneCommandSessions(state);
+
+  return state.sessions.get(sessionId) || null;
+}
+
+function rememberCommandSession(request, commandReply) {
+  if (!request.sessionId) {
+    return;
+  }
+
+  const state = getCommandSessionState();
+  state.sessions.set(request.sessionId, {
+    traceId: request.traceId,
+    robotId: request.robotId,
+    functionName: request.functionName,
+    reply: commandReply.reply,
+    createdAt: Date.now(),
+  });
+  pruneCommandSessions(state);
+}
+
+function detectFlightCommand(content) {
+  const match = typeof content === "string" ? content.match(FLIGHT_NO_PATTERN) : null;
+
+  if (!match?.[1]) {
+    return null;
+  }
+
+  const flightNo = match[1].replace(/\s+/g, "").toUpperCase();
+
+  return {
+    functionName: ROBOT_FUNCTIONS.flight,
+    functionParam: JSON.stringify({ flightNo }),
+  };
+}
 
 export function createInvalidListenJsonResult({ requestId = makeTraceId("listen"), startedAt = Date.now() } = {}) {
   logError("listenQwen", "invalid_json", {
@@ -46,6 +120,91 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
   });
 
   if (request.event === ROBOT_EVENTS.speechContext) {
+    const cachedCommand = readCommandSession(request.sessionId);
+
+    if (cachedCommand) {
+      logInfo("listenQwen", "skip_speech_after_cmd", {
+        traceId: request.traceId,
+        sessionId: request.sessionId,
+        robotId: request.robotId,
+        functionName: cachedCommand.functionName,
+        durationMs: Date.now() - startedAt,
+        replyPreview: previewText(cachedCommand.reply, 120),
+        stream: false,
+      });
+
+      publishRobotEvent("tts_done", {
+        traceId: request.traceId,
+        sessionId: request.sessionId,
+        robotId: request.robotId,
+        event: ROBOT_EVENTS.responseContext,
+        sourceEvent: ROBOT_EVENTS.command,
+        functionName: cachedCommand.functionName,
+        content: cachedCommand.reply,
+        skippedEvent: request.event,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return {
+        status: 200,
+        traceId: request.traceId,
+        body: createResponsePayload(request.robotId, cachedCommand.reply),
+      };
+    }
+
+    const detectedCommand = detectFlightCommand(request.content);
+
+    if (detectedCommand) {
+      const commandRequest = {
+        ...request,
+        event: ROBOT_EVENTS.command,
+        functionName: detectedCommand.functionName,
+        functionParam: detectedCommand.functionParam,
+      };
+
+      publishRobotEvent("final_input", {
+        traceId: request.traceId,
+        requestId,
+        robotId: request.robotId,
+        event: ROBOT_EVENTS.command,
+        language: request.language,
+        sessionId: request.sessionId,
+        functionName: commandRequest.functionName,
+        functionParam: commandRequest.functionParam,
+        content: request.content,
+      });
+
+      const commandReply = createCommandReply(commandRequest);
+      rememberCommandSession(commandRequest, commandReply);
+
+      logInfo("listenQwen", "redirect_speech_to_cmd", {
+        traceId: request.traceId,
+        sessionId: request.sessionId,
+        robotId: request.robotId,
+        functionName: commandRequest.functionName,
+        durationMs: Date.now() - startedAt,
+        replyPreview: previewText(commandReply.reply, 120),
+        stream: false,
+      });
+
+      publishRobotEvent("tts_done", {
+        traceId: request.traceId,
+        sessionId: request.sessionId,
+        robotId: request.robotId,
+        event: ROBOT_EVENTS.responseContext,
+        sourceEvent: ROBOT_EVENTS.command,
+        functionName: commandRequest.functionName,
+        content: commandReply.reply,
+        durationMs: Date.now() - startedAt,
+      });
+
+      return {
+        status: 200,
+        traceId: request.traceId,
+        body: createResponsePayload(request.robotId, commandReply.reply),
+      };
+    }
+
     publishRobotEvent("final_input", {
       traceId: request.traceId,
       requestId,
@@ -69,6 +228,7 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
         traceId: request.traceId,
         sessionId: request.sessionId,
         robotId: request.robotId,
+        sourceEvent: request.event,
         content: chunk,
         chunkIndex: chunkCount,
       });
@@ -144,6 +304,7 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
     });
 
     const commandReply = createCommandReply(request);
+    rememberCommandSession(request, commandReply);
 
     logInfo("listenQwen", "branch_cmd", {
       traceId: request.traceId,

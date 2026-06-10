@@ -239,6 +239,7 @@ export function RobotConsolePage() {
           userMessageId: "",
           assistantMessageId: "",
           latestAsrContent: "",
+          finalEvent: "",
         };
       }
 
@@ -283,6 +284,10 @@ export function RobotConsolePage() {
       const key = getUpstreamConversationKey(event, data);
       const chat = getUpstreamChat(key);
 
+      if (chat.finalEvent === "CMD" && data.sourceEvent === "SPEECH_CONTEXT") {
+        return;
+      }
+
       if (eventName === "asr_partial") {
         chat.latestAsrContent = readText(data.content) || chat.latestAsrContent;
         upsertUpstreamUserMessage(chat, createAsrPartialContent(data));
@@ -290,6 +295,11 @@ export function RobotConsolePage() {
       }
 
       if (eventName === "final_input") {
+        if (chat.finalEvent === "CMD" && data.event === "SPEECH_CONTEXT") {
+          return;
+        }
+
+        chat.finalEvent = data.event || chat.finalEvent;
         upsertUpstreamUserMessage(chat, createUpstreamInputContent(event, data, chat));
         ensureUpstreamAssistantMessage(chat);
         return;
