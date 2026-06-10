@@ -56,6 +56,7 @@ Content-Type: application/json; charset=utf-8
 |---------|------|---------|
 | `SPEECH_CONTEXT` | 用户语音对话 | 用户随意聊天,LLM 没识别到具体意图 |
 | `CMD` | 命令调用 | LLM 把用户语音识别为具体功能(如查航班、查天气、引领等) |
+| `ASR_PARTIAL` | ASR 识别中间结果 | 用户说话过程中,ASR 流式输出的未定稿文本(见 [2.9](#29-asr_partial-中间结果上报)) |
 | `RESPONSE_CONTEXT` | (保留,目前未使用) | — |
 
 ### 2.4 `function` 字段
@@ -241,6 +242,42 @@ POST /robot/listenQwen (event=CMD, function.name=WEATHER, function.param=...)
 
 **中转服务侧的处理:** 解析 `function.param` 里的 `msg` 字段(双层 JSON 字符串),根据天气数据生成播报文本。
 
+### 2.9 `ASR_PARTIAL` 中间结果上报
+
+用户说话过程中,ASR 会**流式**输出尚未定稿的识别文本。客户端把这些**中间结果**通过 `event=ASR_PARTIAL` 实时发给后端,用于业务侧感知"用户正在说什么"。
+
+**与 `SPEECH_CONTEXT` 的区别:**
+
+| | `SPEECH_CONTEXT` | `ASR_PARTIAL` |
+|---|---|---|
+| 时机 | 用户**说完一整句** | 用户**说话过程中** |
+| 文本 | 最终定稿文本 | 未定稿的中间文本,会变动 |
+| 频率 | 一轮一条 | 一轮多条 |
+| 后端是否返回 TTS | **是**,返回 `RESPONSE_CONTEXT` | **否**,只回 HTTP 200 |
+| 是否触发 LLM | 是 | 否 |
+
+字段复用接口 1 的公共字段,`content` 装中间文本,`function` 传空结构。
+
+```json
+{
+  "robotId": "4",
+  "event": "ASR_PARTIAL",
+  "language": "CN",
+  "content": "查国航",
+  "sessionId": "8f3e2a4b-...",
+  "function": {
+    "name": "",
+    "param": ""
+  }
+}
+```
+
+响应规范:
+
+- 后端**只需返回 HTTP 200**,客户端**不解析响应体**
+- 即使返回了 `content`,客户端也会忽略,**不会**送 TTS
+- 失败时客户端只记录日志,**不重试,不影响主流程**
+
 ---
 
 ## 3. 接口 2:`/robot/voiceMonitor`
@@ -252,8 +289,8 @@ POST /robot/listenQwen (event=CMD, function.name=WEATHER, function.param=...)
 
 | 触发点 | 上报值 | 含义 |
 |--------|--------|------|
-| 用户开始说话 / 开始录音 | `"0"` | 机器人开始录音 |
-| 用户说话结束 / 结束录音 | `"1"` | 机器人结束录音,随后客户端会发送 `/robot/listenQwen` |
+| 用户开始说话(语音输入端点检测到 speech_started) | `"1"` | 机器人开始监听 |
+| 用户说话结束(speech_ended) | `"0"` | 机器人开始处理(进入 LLM 等待) |
 
 ### 3.3 请求方法
 ```
@@ -266,25 +303,26 @@ Content-Type: application/json
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `robotId` | string | 是 | 机器人 ID(如 `"4"`) |
-| `status` | string | 是 | 状态值,`"0"` = 开始录音,`"1"` = 结束录音 |
+| `status` | string | 是 | 状态值,`"1"` = 开始说话,`"0"` = 说话结束 |
 
 #### 示例
 
 ```json
-{ "robotId": "4", "status": "0" }
+{ "robotId": "4", "status": "1" }
 ```
 
 ```json
-{ "robotId": "4", "status": "1" }
+{ "robotId": "4", "status": "0" }
 ```
 
 ### 3.5 调用时序
 
 一次普通语音交互通常是:
 
-1. 客户端上报 `/robot/voiceMonitor`, `status="0"`: 开始录音
-2. 客户端上报 `/robot/voiceMonitor`, `status="1"`: 结束录音
-3. 客户端完成 ASR/意图识别后,发送 `/robot/listenQwen`
+1. 客户端上报 `/robot/voiceMonitor`, `status="1"`: 开始说话/开始监听
+2. 用户说话过程中,客户端可多次上报 `/robot/listenQwen`, `event="ASR_PARTIAL"`
+3. 客户端上报 `/robot/voiceMonitor`, `status="0"`: 说话结束/开始处理
+4. 客户端完成 ASR/意图识别后,发送 `/robot/listenQwen`
    - `event="SPEECH_CONTEXT"` 时,`content` 带识别出的文本
    - `event="CMD"` 时,`function.name` / `function.param` 带命令信息
 
@@ -370,12 +408,24 @@ Content-Type: application/json
 # 1. 开始录音
 curl -X POST http://192.168.112.194:8070/robot/voiceMonitor \
   -H "Content-Type: application/json" \
-  -d '{"robotId": "4", "status": "0"}'
+  -d '{"robotId": "4", "status": "1"}'
 
 # 2. 结束录音
 curl -X POST http://192.168.112.194:8070/robot/voiceMonitor \
   -H "Content-Type: application/json" \
-  -d '{"robotId": "4", "status": "1"}'
+  -d '{"robotId": "4", "status": "0"}'
+
+# ASR 中间结果上报
+curl -X POST http://192.168.112.194:8070/robot/listenQwen \
+  -H "Content-Type: application/json" \
+  -d '{
+    "robotId": "4",
+    "event": "ASR_PARTIAL",
+    "language": "CN",
+    "content": "查国航",
+    "sessionId": "test-uuid-001",
+    "function": {"name": "", "param": ""}
+  }'
 
 # 3. 普通对话文本上送
 curl -X POST http://192.168.112.194:8070/robot/listenQwen \
@@ -440,9 +490,9 @@ curl -X POST http://192.168.112.194:8070/robot/listenQwen \
 ```
 {
   "robotId":   "4",
-  "event":     "SPEECH_CONTEXT" | "CMD",
+  "event":     "SPEECH_CONTEXT" | "CMD" | "ASR_PARTIAL",
   "language":  "CN",
-  "content":   "<用户语音文本>" | "",
+  "content":   "<用户语音文本>" | "<ASR中间文本>" | "",
   "sessionId": "<uuid>",
   "function": {
     "name":  "" | "INTRODUCING_PLACES" | "FINDING_PLACES" | "FLIGHT" | "ACCESS" | "WEATHER",
@@ -469,6 +519,8 @@ curl -X POST http://192.168.112.194:8070/robot/listenQwen \
   "status":  "0" | "1"
 }
 ```
+
+其中 `"1"` 表示开始说话,`"0"` 表示说话结束。
 
 ### `/robot/voiceMonitor` 响应
 

@@ -9,9 +9,14 @@ export function createResponsePayload(robotId, content) {
   };
 }
 
+export function createAcceptedPayload() {
+  return { ok: true };
+}
+
 export function normalizeListenPayload(payload, requestId) {
   const robotId = readString(payload?.robotId, DEFAULT_ROBOT_ID);
   const event = readString(payload?.event);
+  const language = readString(payload?.language);
   const content = readString(payload?.content);
   const sessionId = readString(payload?.sessionId);
   const functionName = readString(payload?.function?.name);
@@ -21,6 +26,7 @@ export function normalizeListenPayload(payload, requestId) {
   return {
     robotId,
     event,
+    language,
     content,
     sessionId,
     functionName,

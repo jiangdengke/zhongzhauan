@@ -1,7 +1,8 @@
 import { getDeepSeekReplyStream } from "@/integrations/deepseek/client.js";
 import { logError, logInfo, makeTraceId, previewText } from "@/shared/logging/logger.js";
 import { DEFAULT_ROBOT_ID, ROBOT_EVENTS, ROBOT_REPLIES } from "../domain/constants.js";
-import { createResponsePayload, normalizeListenPayload } from "./listen-request.js";
+import { createCommandReply } from "./command-replies.js";
+import { createAcceptedPayload, createResponsePayload, normalizeListenPayload } from "./listen-request.js";
 
 export function createInvalidListenStreamResult({ requestId = makeTraceId("listen_stream"), startedAt = Date.now() } = {}) {
   logError("listenQwen", "invalid_json", {
@@ -36,6 +37,7 @@ export async function* streamListenQwen(payload, options = {}, dependencies = {}
     requestId,
     robotId: request.robotId,
     event: request.event,
+    language: request.language,
     sessionId: request.sessionId,
     functionName: request.functionName,
     contentPreview: previewText(request.content, 120),
@@ -89,26 +91,47 @@ export async function* streamListenQwen(payload, options = {}, dependencies = {}
     return;
   }
 
+  if (request.event === ROBOT_EVENTS.asrPartial) {
+    logInfo("listenQwen", "asr_partial_received", {
+      traceId: request.traceId,
+      sessionId: request.sessionId,
+      robotId: request.robotId,
+      language: request.language,
+      contentPreview: previewText(request.content, 120),
+      durationMs: Date.now() - startedAt,
+      stream: true,
+    });
+
+    yield {
+      type: "done",
+      data: createAcceptedPayload(),
+    };
+    return;
+  }
+
   if (request.event === ROBOT_EVENTS.command) {
+    const commandReply = createCommandReply(request);
+
     logInfo("listenQwen", "branch_cmd", {
       traceId: request.traceId,
       sessionId: request.sessionId,
       robotId: request.robotId,
       functionName: request.functionName,
+      commandOk: commandReply.ok,
       durationMs: Date.now() - startedAt,
-      replyPreview: previewText(ROBOT_REPLIES.commandAccepted, 120),
+      replyPreview: previewText(commandReply.reply, 120),
       stream: true,
     });
 
     yield {
       type: "delta",
       data: {
-        content: ROBOT_REPLIES.commandAccepted,
+        content: commandReply.reply,
       },
     };
     yield {
       type: "done",
-      data: createResponsePayload(request.robotId, ROBOT_REPLIES.commandAccepted),
+      data: createResponsePayload(request.robotId, commandReply.reply),
     };
     return;
   }

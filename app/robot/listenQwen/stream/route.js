@@ -38,7 +38,7 @@ export async function POST(request) {
     const result = createInvalidListenStreamResult({ requestId, startedAt });
 
     return new Response(createEventStream(result.events), {
-      status: 400,
+      status: 200,
       headers: createSseHeaders({ "x-trace-id": result.traceId }),
     });
   }

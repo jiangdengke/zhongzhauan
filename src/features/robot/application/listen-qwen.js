@@ -1,7 +1,8 @@
 import { getDeepSeekReply } from "@/integrations/deepseek/client.js";
 import { logError, logInfo, makeTraceId, previewText } from "@/shared/logging/logger.js";
 import { DEFAULT_ROBOT_ID, ROBOT_EVENTS, ROBOT_REPLIES } from "../domain/constants.js";
-import { createResponsePayload, normalizeListenPayload } from "./listen-request.js";
+import { createCommandReply } from "./command-replies.js";
+import { createAcceptedPayload, createResponsePayload, normalizeListenPayload } from "./listen-request.js";
 
 export function createInvalidListenJsonResult({ requestId = makeTraceId("listen"), startedAt = Date.now() } = {}) {
   logError("listenQwen", "invalid_json", {
@@ -10,7 +11,7 @@ export function createInvalidListenJsonResult({ requestId = makeTraceId("listen"
   });
 
   return {
-    status: 400,
+    status: 200,
     traceId: requestId,
     body: createResponsePayload(DEFAULT_ROBOT_ID, ROBOT_REPLIES.invalidJson),
   };
@@ -27,6 +28,7 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
     requestId,
     robotId: request.robotId,
     event: request.event,
+    language: request.language,
     sessionId: request.sessionId,
     functionName: request.functionName,
     contentPreview: previewText(request.content, 120),
@@ -58,21 +60,42 @@ export async function handleListenQwen(payload, options = {}, dependencies = {})
     };
   }
 
-  if (request.event === ROBOT_EVENTS.command) {
-    logInfo("listenQwen", "branch_cmd", {
+  if (request.event === ROBOT_EVENTS.asrPartial) {
+    logInfo("listenQwen", "asr_partial_received", {
       traceId: request.traceId,
       sessionId: request.sessionId,
       robotId: request.robotId,
-      functionName: request.functionName,
+      language: request.language,
+      contentPreview: previewText(request.content, 120),
       durationMs: Date.now() - startedAt,
-      replyPreview: previewText(ROBOT_REPLIES.commandAccepted, 120),
       stream: false,
     });
 
     return {
       status: 200,
       traceId: request.traceId,
-      body: createResponsePayload(request.robotId, ROBOT_REPLIES.commandAccepted),
+      body: createAcceptedPayload(),
+    };
+  }
+
+  if (request.event === ROBOT_EVENTS.command) {
+    const commandReply = createCommandReply(request);
+
+    logInfo("listenQwen", "branch_cmd", {
+      traceId: request.traceId,
+      sessionId: request.sessionId,
+      robotId: request.robotId,
+      functionName: request.functionName,
+      commandOk: commandReply.ok,
+      durationMs: Date.now() - startedAt,
+      replyPreview: previewText(commandReply.reply, 120),
+      stream: false,
+    });
+
+    return {
+      status: 200,
+      traceId: request.traceId,
+      body: createResponsePayload(request.robotId, commandReply.reply),
     };
   }
 
